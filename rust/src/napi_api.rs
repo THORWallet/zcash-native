@@ -41,6 +41,9 @@ pub struct JsTransaction {
     pub is_shielding: bool,
     pub is_expired: bool,
     pub memos: Vec<String>,
+    pub is_sent: bool,
+    pub received_note_count: u32,
+    pub sent_note_count: u32,
 }
 
 #[napi(object)]
@@ -90,6 +93,9 @@ impl From<wallet::Transaction> for JsTransaction {
             is_shielding: value.is_shielding,
             is_expired: value.is_expired,
             memos: value.memos,
+            is_sent: value.is_sent,
+            received_note_count: value.received_note_count,
+            sent_note_count: value.sent_note_count,
         }
     }
 }

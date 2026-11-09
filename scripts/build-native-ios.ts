@@ -86,17 +86,8 @@ async function main(): Promise<void> {
 
   const xc = join(iosDir, 'libzcash.xcframework')
   await run('rm', ['-rf', xc], iosDir)
-  // Drop debug symbols from the archives before packaging them. `strip -S`
-  // keeps the symbol table the linker needs, and saves several MB per slice
-  // in a package that is already close to what the registry will accept.
-  for (const target of targets) {
-    await run(
-      'strip',
-      ['-S', join(rustDir, 'target', target, 'release', 'libzcash.a')],
-      rustDir
-    )
-  }
-
+  // No `strip -S` here: Xcode 27's strip corrupts the aws-lc assembly objects,
+  // and the app then fails to link.
   await run(
     'xcodebuild',
     [

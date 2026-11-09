@@ -108,6 +108,9 @@ export interface Transaction {
   isShielding: boolean
   isExpired: boolean
   memos: string[]
+  isSent: boolean
+  receivedNoteCount: number
+  sentNoteCount: number
 }
 
 /** @deprecated Renamed `Transaction` because the package can now return unconfirmed shielding transactions */

@@ -110,6 +110,10 @@ pub fn broadcast_transfer(alias: String, txid: String) -> Result<String, ZcashEr
     map(block_on(wallet::broadcast_transfer(alias, txid)))
 }
 
+pub fn create_shield(alias: String, seed: String, threshold: String) -> Result<String, ZcashError> {
+    map(block_on(wallet::create_shield(alias, seed, threshold)))
+}
+
 pub fn shield_funds(
     alias: String,
     seed: String,

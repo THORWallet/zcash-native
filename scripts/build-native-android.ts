@@ -80,14 +80,13 @@ async function main(): Promise<void> {
       )
   )
 
-  // The two ABIs edge-react-gui ships. x86_64 is only for Intel emulators.
+  // The four ABIs THORWallet ships (reactNativeArchitectures).
   const abis: Array<{ target: string; abi: string }> = [
     { target: 'aarch64-linux-android', abi: 'arm64-v8a' },
-    { target: 'armv7-linux-androideabi', abi: 'armeabi-v7a' }
+    { target: 'armv7-linux-androideabi', abi: 'armeabi-v7a' },
+    { target: 'x86_64-linux-android', abi: 'x86_64' },
+    { target: 'i686-linux-android', abi: 'x86' }
   ]
-  if (process.arch !== 'arm64' || process.env.ZCASH_ANDROID_X86_64 === '1') {
-    abis.push({ target: 'x86_64-linux-android', abi: 'x86_64' })
-  }
 
   // 16 KB pages are required of 64-bit native code on Android 15+.
   const pageSizeFlags =

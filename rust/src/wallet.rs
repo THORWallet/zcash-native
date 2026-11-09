@@ -17,7 +17,7 @@ use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
-use zcash_protocol::TxId;
+use zcash_protocol::{PoolType, TxId};
 use pepper_sync::wallet::WalletTransaction;
 use zingo_netutils::lightwallet_protocol::RawTransaction;
 use zingo_netutils::{GrpcIndexer, Indexer};
@@ -111,6 +111,9 @@ pub struct Transaction {
     pub is_shielding: bool,
     pub is_expired: bool,
     pub memos: Vec<String>,
+    pub is_sent: bool,
+    pub received_note_count: u32,
+    pub sent_note_count: u32,
 }
 
 pub struct Poll {
@@ -527,6 +530,17 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
                 0
             };
             let is_expired = matches!(tx.status, ConfirmationStatus::Failed(_));
+            let shielded_received =
+                tx.sapling_notes.len() + tx.orchard_notes.len() + tx.ironwood_notes.len();
+            // Zero on both counts means a transparent-only transaction.
+            let shielded_sent = tx.outgoing_sapling_notes.len()
+                + tx.outgoing_orchard_notes.len()
+                + tx.outgoing_ironwood_notes.len()
+                + tx
+                    .pools_sent_from
+                    .iter()
+                    .filter(|pool| !matches!(pool, PoolType::Transparent))
+                    .count();
             transactions.push(Transaction {
                 raw_transaction_id: tx.txid.to_string(),
                 block_time_in_seconds: i64::from(tx.datetime),
@@ -537,6 +551,9 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
                 is_shielding,
                 is_expired,
                 memos: memos(tx),
+                is_sent: matches!(tx.kind, TransactionKind::Sent(_)),
+                received_note_count: u32::try_from(shielded_received).unwrap_or(u32::MAX),
+                sent_note_count: u32::try_from(shielded_sent).unwrap_or(u32::MAX),
             });
         }
     }
@@ -1000,6 +1017,59 @@ pub async fn shield_funds(
         .await
         .map_err(|e| describe_error(&e))?;
     Ok(txids.first().to_string())
+}
+
+pub async fn create_shield(alias: String, seed: String, threshold: String) -> WalletResult<String> {
+    let threshold_zats: u64 = threshold
+        .parse()
+        .map_err(|_| format!("invalid shield threshold {threshold}"))?;
+    let slot = client_slot(&alias).await?;
+    let mut slot = slot.lock().await;
+    if slot.mnemonic != seed {
+        return Err("mnemonic mismatch".to_string());
+    }
+
+    let balance = slot
+        .client
+        .account_balance(AccountId::ZERO)
+        .await
+        .map_err(|e| e.to_string())?;
+    let transparent = balance
+        .confirmed_transparent_balance
+        .map(|z| z.into_u64())
+        .unwrap_or(0);
+    if transparent < threshold_zats {
+        return Err("transparent balance below shield threshold".to_string());
+    }
+
+    slot.client
+        .propose_shield(AccountId::ZERO)
+        .await
+        .map_err(|e| describe_error(&e))?;
+    let txids = slot
+        .client
+        .calculate_stored_proposal()
+        .await
+        .map_err(|e| describe_error(&e))?;
+    let txid = *txids.last();
+    if slot.signed.len() >= MAX_QUOTES {
+        slot.signed.pop_front();
+    }
+    slot.signed.push_back(txids);
+    let raw = {
+        let wallet = slot.client.wallet().read().await;
+        let transaction = wallet
+            .wallet_transactions
+            .get(&txid)
+            .ok_or_else(|| format!("signed tx {txid} missing from wallet"))?;
+        let mut bytes = Vec::new();
+        transaction
+            .transaction()
+            .write(&mut bytes)
+            .map_err(|e| e.to_string())?;
+        hex::encode(bytes)
+    };
+    Ok(spend_success_json(txid.to_string(), raw))
 }
 
 pub async fn propose_orchard_to_ironwood_migration(alias: String) -> WalletResult<String> {

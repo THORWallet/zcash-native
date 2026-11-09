@@ -12,11 +12,18 @@ class RNZcash: RCTEventEmitter {
     if RNZcash.didSetDocumentDirectory {
       return
     }
-    let root = try FileManager.default.url(
-      for: .documentDirectory, in: .userDomainMask, appropriateFor: nil, create: true)
+    // Kept out of iCloud backups.
+    let fileManager = FileManager.default
+    var root = try fileManager.url(
+      for: .applicationSupportDirectory, in: .userDomainMask, appropriateFor: nil, create: true
+    ).appendingPathComponent("zcash", isDirectory: true)
+    try fileManager.createDirectory(at: root, withIntermediateDirectories: true)
+    var values = URLResourceValues()
+    values.isExcludedFromBackup = true
+    try root.setResourceValues(values)
     let path = root.appendingPathComponent("native/zcash", isDirectory: true).path
     try EdgeZcashClient.rustSetDocumentDirectory(path: path)
-    // The ECC SDK kept its files at the Documents root. Retiring them is
+    // The ECC SDK kept its files at this root. Retiring them is
     // best effort and never blocks the wallet.
     try? EdgeZcashClient.rustSetLegacyDirectory(path: root.path)
     RNZcash.didSetDocumentDirectory = true
@@ -48,6 +55,9 @@ class RNZcash: RCTEventEmitter {
         "value": tx.value,
         "isShielding": tx.isShielding,
         "isExpired": tx.isExpired,
+        "isSent": tx.isSent,
+        "receivedNoteCount": tx.receivedNoteCount,
+        "sentNoteCount": tx.sentNoteCount,
         "memos": tx.memos,
       ]
       if let fee = tx.fee {
@@ -166,6 +176,16 @@ class RNZcash: RCTEventEmitter {
   ) {
     run(resolve, reject, "broadcastTransfer") {
       try EdgeZcashClient.rustBroadcastTransfer(alias: alias, txid: txid)
+    }
+  }
+
+  @objc func createShield(
+    _ alias: String, _ seed: String, _ threshold: String,
+    resolver resolve: @escaping RCTPromiseResolveBlock,
+    rejecter reject: @escaping RCTPromiseRejectBlock
+  ) {
+    run(resolve, reject, "createShield") {
+      try EdgeZcashClient.rustCreateShield(alias: alias, seed: seed, threshold: threshold)
     }
   }
 

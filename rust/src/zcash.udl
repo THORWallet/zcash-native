@@ -30,6 +30,9 @@ dictionary Transaction {
   boolean is_shielding;
   boolean is_expired;
   sequence<string> memos;
+  boolean is_sent;
+  u32 received_note_count;
+  u32 sent_note_count;
 };
 
 dictionary Poll {
@@ -95,6 +98,9 @@ namespace zcash {
 
   [Throws=ZcashError]
   string shield_funds(string alias, string seed, string memo, string threshold);
+
+  [Throws=ZcashError]
+  string create_shield(string alias, string seed, string threshold);
 
   [Throws=ZcashError]
   string propose_orchard_to_ironwood_migration(string alias);

@@ -819,10 +819,13 @@ public struct Transaction {
     public var isShielding: Bool
     public var isExpired: Bool
     public var memos: [String]
+    public var isSent: Bool
+    public var receivedNoteCount: UInt32
+    public var sentNoteCount: UInt32
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(rawTransactionId: String, blockTimeInSeconds: Int64, minedHeight: Int64, value: String, fee: String?, toAddress: String?, isShielding: Bool, isExpired: Bool, memos: [String]) {
+    public init(rawTransactionId: String, blockTimeInSeconds: Int64, minedHeight: Int64, value: String, fee: String?, toAddress: String?, isShielding: Bool, isExpired: Bool, memos: [String], isSent: Bool, receivedNoteCount: UInt32, sentNoteCount: UInt32) {
         self.rawTransactionId = rawTransactionId
         self.blockTimeInSeconds = blockTimeInSeconds
         self.minedHeight = minedHeight
@@ -832,6 +835,9 @@ public struct Transaction {
         self.isShielding = isShielding
         self.isExpired = isExpired
         self.memos = memos
+        self.isSent = isSent
+        self.receivedNoteCount = receivedNoteCount
+        self.sentNoteCount = sentNoteCount
     }
 }
 
@@ -869,6 +875,15 @@ extension Transaction: Equatable, Hashable {
         if lhs.memos != rhs.memos {
             return false
         }
+        if lhs.isSent != rhs.isSent {
+            return false
+        }
+        if lhs.receivedNoteCount != rhs.receivedNoteCount {
+            return false
+        }
+        if lhs.sentNoteCount != rhs.sentNoteCount {
+            return false
+        }
         return true
     }
 
@@ -882,6 +897,9 @@ extension Transaction: Equatable, Hashable {
         hasher.combine(isShielding)
         hasher.combine(isExpired)
         hasher.combine(memos)
+        hasher.combine(isSent)
+        hasher.combine(receivedNoteCount)
+        hasher.combine(sentNoteCount)
     }
 }
 
@@ -902,7 +920,10 @@ public struct FfiConverterTypeTransaction: FfiConverterRustBuffer {
                 toAddress: FfiConverterOptionString.read(from: &buf), 
                 isShielding: FfiConverterBool.read(from: &buf), 
                 isExpired: FfiConverterBool.read(from: &buf), 
-                memos: FfiConverterSequenceString.read(from: &buf)
+                memos: FfiConverterSequenceString.read(from: &buf), 
+                isSent: FfiConverterBool.read(from: &buf), 
+                receivedNoteCount: FfiConverterUInt32.read(from: &buf), 
+                sentNoteCount: FfiConverterUInt32.read(from: &buf)
         )
     }
 
@@ -916,6 +937,9 @@ public struct FfiConverterTypeTransaction: FfiConverterRustBuffer {
         FfiConverterBool.write(value.isShielding, into: &buf)
         FfiConverterBool.write(value.isExpired, into: &buf)
         FfiConverterSequenceString.write(value.memos, into: &buf)
+        FfiConverterBool.write(value.isSent, into: &buf)
+        FfiConverterUInt32.write(value.receivedNoteCount, into: &buf)
+        FfiConverterUInt32.write(value.sentNoteCount, into: &buf)
     }
 }
 
@@ -1115,6 +1139,15 @@ public func broadcastTransfer(alias: String, txid: String)throws  -> String  {
     )
 })
 }
+public func createShield(alias: String, seed: String, threshold: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeZcashError_lift) {
+    uniffi_zcash_fn_func_create_shield(
+        FfiConverterString.lower(alias),
+        FfiConverterString.lower(seed),
+        FfiConverterString.lower(threshold),$0
+    )
+})
+}
 public func createTransfer(alias: String, proposalBase64: String, mnemonicSeed: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeZcashError_lift) {
     uniffi_zcash_fn_func_create_transfer(
@@ -1271,6 +1304,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.contractVersionMismatch
     }
     if (uniffi_zcash_checksum_func_broadcast_transfer() != 16095) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_zcash_checksum_func_create_shield() != 37469) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_zcash_checksum_func_create_transfer() != 61268) {

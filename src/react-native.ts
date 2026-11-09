@@ -175,6 +175,23 @@ export class Synchronizer {
     return result
   }
 
+  async createShield(
+    shieldFundsInfo: ShieldFundsInfo
+  ): Promise<SpendSuccess | SpendFailure> {
+    try {
+      const result = await RNZcash.createShield(
+        this.alias,
+        shieldFundsInfo.seed,
+        shieldFundsInfo.threshold
+      )
+      return parseJsonObject(result) as SpendSuccess
+    } catch (error) {
+      const errorMessage =
+        error instanceof Error ? error.message : String(error)
+      return { errorMessage }
+    }
+  }
+
   async shieldFunds(shieldFundsInfo: ShieldFundsInfo): Promise<string> {
     const result = await RNZcash.shieldFunds(
       this.alias,

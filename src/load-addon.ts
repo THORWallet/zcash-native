@@ -52,6 +52,9 @@ export interface NativeZcashAddon {
       toAddress?: string
       isShielding: boolean
       isExpired: boolean
+      isSent: boolean
+      receivedNoteCount: number
+      sentNoteCount: number
       memos: string[]
     }>
   }>

@@ -58,6 +58,13 @@ resolver:(RCTPromiseResolveBlock)resolve
 rejecter:(RCTPromiseRejectBlock)reject
 )
 
+RCT_EXTERN_METHOD(createShield:(NSString *)alias
+:(NSString *)seed
+:(NSString *)threshold
+resolver:(RCTPromiseResolveBlock)resolve
+rejecter:(RCTPromiseRejectBlock)reject
+)
+
 RCT_EXTERN_METHOD(shieldFunds:(NSString *)alias
 :(NSString *)seed
 :(NSString *)memo

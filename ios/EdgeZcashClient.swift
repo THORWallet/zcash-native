@@ -91,6 +91,10 @@ enum EdgeZcashClient {
     try shieldFunds(alias: alias, seed: seed, memo: memo, threshold: threshold)
   }
 
+  static func rustCreateShield(alias: String, seed: String, threshold: String) throws -> String {
+    try createShield(alias: alias, seed: seed, threshold: threshold)
+  }
+
   static func rustProposeOrchardToIronwoodMigration(alias: String) throws -> String {
     try proposeOrchardToIronwoodMigration(alias: alias)
   }

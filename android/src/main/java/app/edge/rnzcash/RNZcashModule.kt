@@ -74,6 +74,9 @@ class RNZcashModule(
             tx.toAddress?.let { map.putString("toAddress", it) }
             map.putBoolean("isShielding", tx.isShielding)
             map.putBoolean("isExpired", tx.isExpired)
+            map.putBoolean("isSent", tx.isSent)
+            map.putInt("receivedNoteCount", tx.receivedNoteCount.toInt())
+            map.putInt("sentNoteCount", tx.sentNoteCount.toInt())
             map.putArray("memos", Arguments.fromList(tx.memos))
             transactions.pushMap(map)
         }
@@ -221,6 +224,18 @@ class RNZcashModule(
     ) {
         moduleScope.launch {
             promise.wrap { uniffi.zcash.broadcastTransfer(alias, txid) }
+        }
+    }
+
+    @ReactMethod
+    fun createShield(
+        alias: String,
+        seed: String,
+        threshold: String,
+        promise: Promise,
+    ) {
+        moduleScope.launch {
+            promise.wrap { uniffi.zcash.createShield(alias, seed, threshold) }
         }
     }
 

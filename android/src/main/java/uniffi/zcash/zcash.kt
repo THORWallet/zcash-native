@@ -749,6 +749,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 
 
 
+
+
 // For large crates we prevent `MethodTooLargeException` (see #2340)
 // N.B. the name of the extension is very misleading, since it is 
 // rather `InterfaceTooLargeException`, caused by too many methods 
@@ -765,6 +767,8 @@ internal interface UniffiForeignFutureCompleteVoid : com.sun.jna.Callback {
 internal interface IntegrityCheckingUniffiLib : Library {
     // Integrity check functions only
     fun uniffi_zcash_checksum_func_broadcast_transfer(
+): Short
+fun uniffi_zcash_checksum_func_create_shield(
 ): Short
 fun uniffi_zcash_checksum_func_create_transfer(
 ): Short
@@ -848,6 +852,8 @@ internal interface UniffiLib : Library {
 
     // FFI functions
     fun uniffi_zcash_fn_func_broadcast_transfer(`alias`: RustBuffer.ByValue,`txid`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
+): RustBuffer.ByValue
+fun uniffi_zcash_fn_func_create_shield(`alias`: RustBuffer.ByValue,`seed`: RustBuffer.ByValue,`threshold`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
 fun uniffi_zcash_fn_func_create_transfer(`alias`: RustBuffer.ByValue,`proposalBase64`: RustBuffer.ByValue,`mnemonicSeed`: RustBuffer.ByValue,uniffi_out_err: UniffiRustCallStatus, 
 ): RustBuffer.ByValue
@@ -1012,6 +1018,9 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_zcash_checksum_func_broadcast_transfer() != 16095.toShort()) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_zcash_checksum_func_create_shield() != 37469.toShort()) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_zcash_checksum_func_create_transfer() != 61268.toShort()) {
@@ -1447,7 +1456,10 @@ data class Transaction (
     var `toAddress`: kotlin.String?, 
     var `isShielding`: kotlin.Boolean, 
     var `isExpired`: kotlin.Boolean, 
-    var `memos`: List<kotlin.String>
+    var `memos`: List<kotlin.String>, 
+    var `isSent`: kotlin.Boolean, 
+    var `receivedNoteCount`: kotlin.UInt, 
+    var `sentNoteCount`: kotlin.UInt
 ) {
     
     companion object
@@ -1468,6 +1480,9 @@ public object FfiConverterTypeTransaction: FfiConverterRustBuffer<Transaction> {
             FfiConverterBoolean.read(buf),
             FfiConverterBoolean.read(buf),
             FfiConverterSequenceString.read(buf),
+            FfiConverterBoolean.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
         )
     }
 
@@ -1480,7 +1495,10 @@ public object FfiConverterTypeTransaction: FfiConverterRustBuffer<Transaction> {
             FfiConverterOptionalString.allocationSize(value.`toAddress`) +
             FfiConverterBoolean.allocationSize(value.`isShielding`) +
             FfiConverterBoolean.allocationSize(value.`isExpired`) +
-            FfiConverterSequenceString.allocationSize(value.`memos`)
+            FfiConverterSequenceString.allocationSize(value.`memos`) +
+            FfiConverterBoolean.allocationSize(value.`isSent`) +
+            FfiConverterUInt.allocationSize(value.`receivedNoteCount`) +
+            FfiConverterUInt.allocationSize(value.`sentNoteCount`)
     )
 
     override fun write(value: Transaction, buf: ByteBuffer) {
@@ -1493,6 +1511,9 @@ public object FfiConverterTypeTransaction: FfiConverterRustBuffer<Transaction> {
             FfiConverterBoolean.write(value.`isShielding`, buf)
             FfiConverterBoolean.write(value.`isExpired`, buf)
             FfiConverterSequenceString.write(value.`memos`, buf)
+            FfiConverterBoolean.write(value.`isSent`, buf)
+            FfiConverterUInt.write(value.`receivedNoteCount`, buf)
+            FfiConverterUInt.write(value.`sentNoteCount`, buf)
     }
 }
 
@@ -1679,6 +1700,16 @@ public object FfiConverterSequenceTypeTransaction: FfiConverterRustBuffer<List<T
     uniffiRustCallWithError(ZcashException) { _status ->
     UniffiLib.INSTANCE.uniffi_zcash_fn_func_broadcast_transfer(
         FfiConverterString.lower(`alias`),FfiConverterString.lower(`txid`),_status)
+}
+    )
+    }
+    
+
+    @Throws(ZcashException::class) fun `createShield`(`alias`: kotlin.String, `seed`: kotlin.String, `threshold`: kotlin.String): kotlin.String {
+            return FfiConverterString.lift(
+    uniffiRustCallWithError(ZcashException) { _status ->
+    UniffiLib.INSTANCE.uniffi_zcash_fn_func_create_shield(
+        FfiConverterString.lower(`alias`),FfiConverterString.lower(`seed`),FfiConverterString.lower(`threshold`),_status)
 }
     )
     }
