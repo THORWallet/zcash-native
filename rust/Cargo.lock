@@ -780,6 +780,7 @@ dependencies = [
  "zcash_client_backend",
  "zcash_keys",
  "zcash_protocol",
+ "zingo-netutils",
  "zingo-status",
  "zingolib",
  "zip32",

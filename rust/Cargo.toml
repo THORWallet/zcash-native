@@ -51,6 +51,7 @@ zingolib = { git = "https://github.com/EdgeApp/zingolib", rev = "c8ceeb921c10d95
     "runtime-sapling-params",
 ] }
 zingo-status = { git = "https://github.com/EdgeApp/zingolib", rev = "c8ceeb921c10d95da46d32c475730ac7537e8341" }
+zingo-netutils = { git = "https://github.com/EdgeApp/zingolib", rev = "c8ceeb921c10d95da46d32c475730ac7537e8341" }
 zip32 = "0.3"
 
 [build-dependencies]

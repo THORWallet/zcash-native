@@ -18,6 +18,9 @@ use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::TxId;
+use pepper_sync::wallet::WalletTransaction;
+use zingo_netutils::lightwallet_protocol::RawTransaction;
+use zingo_netutils::{GrpcIndexer, Indexer};
 use zingo_status::confirmation_status::ConfirmationStatus;
 use zingolib::config::{ChainType, ClientConfig, WalletConfig, construct_indexer_uri};
 use zingolib::data::proposal::{total_fee, ProportionalFeeProposal};
@@ -856,16 +859,107 @@ pub async fn broadcast_transfer(alias: String, txid: String) -> WalletResult<Str
     };
     // Every transaction from the signing that produced this txid goes out,
     // in order, so a TEX payment's ephemeral step is followed by the payment.
-    let txids = match slot.signed.iter().position(|ids| *ids.last() == parsed) {
-        Some(index) => slot.signed.remove(index).expect("index in range"),
-        None => NonEmpty::new(parsed),
+    // After a restart the group is gone, so the unsent transactions this one
+    // spends from stand in for it.
+    let txids: Vec<TxId> = match slot.signed.iter().find(|ids| *ids.last() == parsed) {
+        Some(ids) => ids.iter().copied().collect(),
+        None => {
+            let wallet = slot.client.wallet().read().await;
+            let mut ids = unsent_parents(&wallet.wallet_transactions, parsed);
+            ids.push(parsed);
+            ids
+        }
     };
-    let sent = slot
+
+    // Sent here rather than through zingolib's transmit, which marks a
+    // transaction Failed and releases its notes when the send errors. A
+    // failed send may still have reached the network, so the transaction
+    // stays unsent and can be sent again until it expires.
+    let uri = slot
         .client
-        .transmit_calculated(txids)
-        .await
-        .map_err(|e| describe_error(&e))?;
-    Ok(sent.last().to_string())
+        .indexer_uri()
+        .ok_or_else(|| "no indexer configured".to_string())?;
+    let mut indexer = GrpcIndexer::new(uri).await.map_err(|e| e.to_string())?;
+    for id in &txids {
+        let (data, height) = {
+            let wallet = slot.client.wallet().read().await;
+            let transaction = wallet
+                .wallet_transactions
+                .get(id)
+                .ok_or_else(|| format!("signed tx {id} missing from wallet"))?;
+            match transaction.status() {
+                ConfirmationStatus::Calculated(height) => {
+                    let mut data = Vec::new();
+                    transaction
+                        .transaction()
+                        .write(&mut data)
+                        .map_err(|e| e.to_string())?;
+                    (data, height)
+                }
+                ConfirmationStatus::Failed(_) => {
+                    return Err(format!("transaction {id} expired before it was sent"));
+                }
+                _ => continue,
+            }
+        };
+        let raw = RawTransaction {
+            data,
+            height: u64::from(u32::from(height)),
+        };
+        match indexer.send_transaction(raw, BROADCAST_TIMEOUT).await {
+            Ok(_) => {}
+            Err(status) if already_known(status.message()) => {}
+            Err(status) => {
+                return Err(format!("broadcast of {id} failed: {}", status.message()));
+            }
+        }
+        let mut wallet = slot.client.wallet().write().await;
+        if let Some(transaction) = wallet.wallet_transactions.get_mut(id) {
+            transaction.update_status(ConfirmationStatus::Transmitted(height), now_secs(), false);
+        }
+        wallet.mark_dirty();
+    }
+    if let Some(index) = slot.signed.iter().position(|ids| *ids.last() == parsed) {
+        slot.signed.remove(index);
+    }
+    Ok(parsed.to_string())
+}
+
+const BROADCAST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// A node that already has the transaction answers with an error, but the
+/// transaction is out.
+fn already_known(message: &str) -> bool {
+    let message = message.to_ascii_lowercase();
+    message.contains("txn-already") || message.contains("already in block chain")
+}
+
+/// The wallet's unsent transactions that `txid` spends transparent outputs of.
+fn unsent_parents(transactions: &HashMap<TxId, WalletTransaction>, txid: TxId) -> Vec<TxId> {
+    let mut parents = Vec::new();
+    let Some(bundle) = transactions
+        .get(&txid)
+        .and_then(|transaction| transaction.transaction().transparent_bundle())
+    else {
+        return parents;
+    };
+    for input in &bundle.vin {
+        let parent = TxId::from_bytes(*input.prevout().hash());
+        let unsent = transactions
+            .get(&parent)
+            .is_some_and(|p| matches!(p.status(), ConfirmationStatus::Calculated(_)));
+        if unsent && !parents.contains(&parent) {
+            parents.push(parent);
+        }
+    }
+    parents
+}
+
+fn now_secs() -> u32 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| u32::try_from(d.as_secs()).unwrap_or(u32::MAX))
+        .unwrap_or(0)
 }
 
 pub async fn shield_funds(
@@ -940,4 +1034,23 @@ pub async fn propose_fulfilling_payment_uri(
 
 pub async fn emit_existing_transactions(_alias: String) -> WalletResult<()> {
     Ok(())
+}
+
+#[cfg(test)]
+mod broadcast_tests {
+    use super::already_known;
+
+    #[test]
+    fn a_node_that_has_the_transaction_counts_as_sent() {
+        assert!(already_known("txn-already-in-mempool"));
+        assert!(already_known("18: txn-already-known"));
+        assert!(already_known("transaction already in block chain"));
+    }
+
+    #[test]
+    fn a_rejection_does_not() {
+        assert!(!already_known("bad-txns-inputs-spent"));
+        assert!(!already_known("tx expired"));
+        assert!(!already_known("transport error"));
+    }
 }
