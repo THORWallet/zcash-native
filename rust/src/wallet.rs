@@ -1,4 +1,4 @@
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::num::NonZeroU32;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU64, Ordering as AtomicOrdering};
@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 
 use nonempty::NonEmpty;
 use once_cell::sync::Lazy;
+use secrecy::ExposeSecret;
 use pepper_sync::error::SyncRecoveryObservables;
 use pepper_sync::wallet::SyncMode;
 use zcash_address::{ToAddress, ZcashAddress};
@@ -13,12 +14,14 @@ use zcash_client_backend::data_api::error::Error as ZcbError;
 use zcash_client_backend::zip321::TransactionRequest;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::encoding::AddressCodec;
-use zcash_keys::keys::UnifiedFullViewingKey;
+use zcash_keys::keys::{Era, UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
 use zcash_protocol::{PoolType, TxId};
 use pepper_sync::wallet::WalletTransaction;
+use pepper_sync::keys::transparent::TransparentScope;
+use pepper_sync::wallet::OutputInterface;
 use zingo_netutils::lightwallet_protocol::RawTransaction;
 use zingo_netutils::{GrpcIndexer, Indexer};
 use zingo_status::confirmation_status::ConfirmationStatus;
@@ -254,6 +257,43 @@ fn request_sapling_params_once(has_sapling: bool) {
     });
 }
 
+/// Account 0's spending key, so the wallet file never holds the seed phrase.
+fn usk_wallet_config(
+    chain: &ChainType,
+    mnemonic_seed: &str,
+    birthday_height: u32,
+) -> WalletResult<WalletConfig> {
+    let mnemonic = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic_seed)
+        .map_err(|e| e.to_string())?;
+    let usk = UnifiedSpendingKey::from_seed(chain, &mnemonic.to_seed(""), AccountId::ZERO)
+        .map_err(|e| format!("{e:?}"))?;
+    Ok(WalletConfig::Usk {
+        usk: usk.to_bytes(Era::Orchard).expose_secret().clone(),
+        birthday: birthday_height,
+        wallet_settings: wallet_settings(),
+    })
+}
+
+async fn open_client(
+    wallet_dir: &std::path::Path,
+    chain: ChainType,
+    uri: http::Uri,
+    wallet_config: WalletConfig,
+    overwrite: bool,
+) -> WalletResult<LightClient> {
+    let config = ClientConfig::builder()
+        .set_wallet_dir(wallet_dir.to_path_buf())
+        .set_wallet_name("zingo-wallet.dat".to_string())
+        .set_chain_type(chain)
+        .set_indexer_uri(uri)
+        .set_wallet_config(wallet_config)
+        .build()
+        .map_err(|e| e.to_string())?;
+    LightClient::new(config, overwrite)
+        .await
+        .map_err(|e| e.to_string())
+}
+
 pub async fn initialize(
     mnemonic_seed: String,
     birthday_height: u32,
@@ -276,17 +316,6 @@ pub async fn initialize(
         let _ = tokio::task::spawn_blocking(move || crate::legacy::retire_alias(&alias)).await;
     }
 
-    let wallet_config = if exists && !new_wallet {
-        WalletConfig::Read
-    } else {
-        WalletConfig::MnemonicPhrase {
-            mnemonic_phrase: mnemonic_seed.clone(),
-            no_of_accounts: NonZeroU32::new(1).expect("1 is non-zero"),
-            birthday: birthday_height,
-            wallet_settings: wallet_settings(),
-        }
-    };
-
     // A client still open on this wallet would keep saving to the file the
     // new one reads, so it is shut down first.
     let previous = CLIENTS.lock().await.remove(&alias);
@@ -294,18 +323,35 @@ pub async fn initialize(
         shut_down(previous).await;
     }
 
-    let config = ClientConfig::builder()
-        .set_wallet_dir(wallet_dir)
-        .set_wallet_name("zingo-wallet.dat".to_string())
-        .set_chain_type(chain)
-        .set_indexer_uri(uri)
-        .set_wallet_config(wallet_config)
-        .build()
-        .map_err(|e| e.to_string())?;
-
-    let mut client = LightClient::new(config, new_wallet)
-        .await
-        .map_err(|e| e.to_string())?;
+    // zingolib stores a phrase wallet's seed unencrypted, so the file is built
+    // from the Zcash spending key; older phrase files are rebuilt (rescan).
+    let mut client = if exists && !new_wallet {
+        let stored = open_client(&wallet_dir, chain, uri.clone(), WalletConfig::Read, false).await?;
+        if stored.recovery_info().await.is_none() {
+            stored
+        } else {
+            drop(stored);
+            std::fs::remove_file(&wallet_path).map_err(|e| e.to_string())?;
+            let _ = std::fs::remove_file(wallet_dir.join("zingo-wallet.dat.tmp"));
+            open_client(
+                &wallet_dir,
+                chain,
+                uri.clone(),
+                usk_wallet_config(&chain, &mnemonic_seed, birthday_height)?,
+                true,
+            )
+            .await?
+        }
+    } else {
+        open_client(
+            &wallet_dir,
+            chain,
+            uri.clone(),
+            usk_wallet_config(&chain, &mnemonic_seed, birthday_height)?,
+            new_wallet,
+        )
+        .await?
+    };
     client.save_task().await;
     client.sync().await.map_err(|e| e.to_string())?;
 
@@ -517,8 +563,30 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
     // Stored data that cannot be summarized fails the same way on every poll,
     // so it must not hold back the balances and status above.
     let mut transactions = Vec::new();
+    // A TEX payment is a shielded spend into an ephemeral address, then a
+    // transparent spend to the recipient: show it once, as a shielded send.
+    let (ephemeral_funding, ephemeral_payments) = {
+        let wallet = slot.client.wallet().read().await;
+        let mut funding: HashSet<TxId> = HashSet::new();
+        let mut payments: HashSet<TxId> = HashSet::new();
+        for coin in wallet
+            .wallet_transactions
+            .values()
+            .flat_map(|transaction| transaction.transparent_coins())
+            .filter(|coin| matches!(coin.key_id().scope(), TransparentScope::Refund))
+        {
+            if let Some(spender) = coin.spending_transaction() {
+                funding.insert(coin.output_id().txid());
+                payments.insert(spender);
+            }
+        }
+        (funding, payments)
+    };
     if let Ok(summaries) = slot.client.transaction_summaries(false).await {
         for tx in summaries.iter() {
+            if ephemeral_funding.contains(&tx.txid) {
+                continue;
+            }
             let is_shielding = matches!(tx.kind, TransactionKind::Sent(SendType::Shield));
             let to_address = match tx.kind {
                 TransactionKind::Sent(_) => sent_to_address(tx),
@@ -540,7 +608,8 @@ pub async fn poll(alias: String) -> WalletResult<Poll> {
                     .pools_sent_from
                     .iter()
                     .filter(|pool| !matches!(pool, PoolType::Transparent))
-                    .count();
+                    .count()
+                + usize::from(ephemeral_payments.contains(&tx.txid));
             transactions.push(Transaction {
                 raw_transaction_id: tx.txid.to_string(),
                 block_time_in_seconds: i64::from(tx.datetime),
