@@ -274,6 +274,18 @@ fn usk_wallet_config(
     })
 }
 
+/// Whether the wallet holds a transaction it built or broadcast that is not
+/// mined yet.
+async fn has_unmined_sends(client: &LightClient) -> bool {
+    let wallet = client.wallet().read().await;
+    wallet.wallet_transactions.values().any(|transaction| {
+        matches!(
+            transaction.status(),
+            ConfirmationStatus::Calculated(_) | ConfirmationStatus::Transmitted(_)
+        )
+    })
+}
+
 async fn open_client(
     wallet_dir: &std::path::Path,
     chain: ChainType,
@@ -325,9 +337,12 @@ pub async fn initialize(
 
     // zingolib stores a phrase wallet's seed unencrypted, so the file is built
     // from the Zcash spending key; older phrase files are rebuilt (rescan).
+    // A rebuild forgets sends that are not mined yet, so their notes would
+    // look spendable until the rescan finds them: such a file is kept for
+    // this launch and rebuilt on a later one, once nothing is in flight.
     let mut client = if exists && !new_wallet {
         let stored = open_client(&wallet_dir, chain, uri.clone(), WalletConfig::Read, false).await?;
-        if stored.recovery_info().await.is_none() {
+        if stored.recovery_info().await.is_none() || has_unmined_sends(&stored).await {
             stored
         } else {
             drop(stored);
