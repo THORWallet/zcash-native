@@ -6,7 +6,6 @@ use std::sync::{Arc, Mutex};
 
 use nonempty::NonEmpty;
 use once_cell::sync::Lazy;
-use secrecy::ExposeSecret;
 use pepper_sync::error::SyncRecoveryObservables;
 use pepper_sync::wallet::SyncMode;
 use zcash_address::{ToAddress, ZcashAddress};
@@ -14,7 +13,7 @@ use zcash_client_backend::data_api::error::Error as ZcbError;
 use zcash_client_backend::zip321::TransactionRequest;
 use zcash_keys::address::UnifiedAddress;
 use zcash_keys::encoding::AddressCodec;
-use zcash_keys::keys::{Era, UnifiedFullViewingKey, UnifiedSpendingKey};
+use zcash_keys::keys::{UnifiedFullViewingKey, UnifiedSpendingKey};
 use zcash_protocol::consensus::NetworkType;
 use zcash_protocol::memo::MemoBytes;
 use zcash_protocol::value::Zatoshis;
@@ -257,21 +256,99 @@ fn request_sapling_params_once(has_sapling: bool) {
     });
 }
 
-/// Account 0's spending key, so the wallet file never holds the seed phrase.
-fn usk_wallet_config(
+/// Account 0's spending key, derived from the phrase the app passes on every
+/// launch and every signing.
+fn spending_key(chain: &ChainType, mnemonic_seed: &str) -> WalletResult<UnifiedSpendingKey> {
+    let mnemonic = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic_seed)
+        .map_err(|e| e.to_string())?;
+    UnifiedSpendingKey::from_seed(chain, &mnemonic.to_seed(""), AccountId::ZERO)
+        .map_err(|e| format!("{e:?}"))
+}
+
+/// Account 0's viewing key, so the wallet file holds neither the seed phrase
+/// nor a key that can spend. Signing puts the spending key in for the call
+/// only, see `unlock_spending_key`.
+fn ufvk_wallet_config(
     chain: &ChainType,
     mnemonic_seed: &str,
     birthday_height: u32,
 ) -> WalletResult<WalletConfig> {
-    let mnemonic = bip0039::Mnemonic::<bip0039::English>::from_phrase(mnemonic_seed)
+    let ufvk = spending_key(chain, mnemonic_seed)?
+        .to_unified_full_viewing_key()
+        .encode(chain)
         .map_err(|e| e.to_string())?;
-    let usk = UnifiedSpendingKey::from_seed(chain, &mnemonic.to_seed(""), AccountId::ZERO)
-        .map_err(|e| format!("{e:?}"))?;
-    Ok(WalletConfig::Usk {
-        usk: usk.to_bytes(Era::Orchard).expose_secret().clone(),
+    Ok(WalletConfig::Ufvk {
+        ufvk,
         birthday: birthday_height,
         wallet_settings: wallet_settings(),
     })
+}
+
+/// Puts account 0's spending key in the key store for one signing. The save
+/// task is stopped first, so the wallet file is never written while the key
+/// store holds the spending key. Returns the viewing key that
+/// `lock_spending_key` puts back.
+async fn unlock_spending_key(slot: &mut ClientSlot) -> WalletResult<UnifiedFullViewingKey> {
+    let chain = slot.client.chain_type();
+    let usk = spending_key(&chain, &slot.mnemonic)?;
+    let ufvk = usk.to_unified_full_viewing_key();
+    {
+        let wallet = slot.client.wallet().read().await;
+        let stored = wallet
+            .unified_key_store
+            .get(&AccountId::ZERO)
+            .ok_or_else(|| "wallet has no account 0 keys".to_string())?;
+        let stored = UnifiedFullViewingKey::try_from(stored).map_err(|e| e.to_string())?;
+        let stored_orchard = stored.orchard().map(|fvk| fvk.to_bytes());
+        if stored_orchard.is_none() || stored_orchard != ufvk.orchard().map(|fvk| fvk.to_bytes()) {
+            return Err("spending key does not match this wallet".to_string());
+        }
+    }
+    // The save task's last pass runs here, while the key store still holds
+    // only the viewing key.
+    if let Err(e) = slot.client.shutdown_save_task().await {
+        slot.client.save_task().await;
+        return Err(e.to_string());
+    }
+    slot.client
+        .wallet()
+        .write()
+        .await
+        .unified_key_store
+        .insert(AccountId::ZERO, UnifiedKeyStore::Spend(Box::new(usk)));
+    Ok(ufvk)
+}
+
+/// Puts the viewing key back in place of the spending key, then restarts the
+/// save task, which from here on writes only the viewing key.
+async fn lock_spending_key(slot: &mut ClientSlot, ufvk: UnifiedFullViewingKey) {
+    slot.client
+        .wallet()
+        .write()
+        .await
+        .unified_key_store
+        .insert(AccountId::ZERO, UnifiedKeyStore::View(Box::new(ufvk)));
+    slot.client.save_task().await;
+}
+
+/// A file written by v0.1.1-tw.2 holds account 0's spending key. It is
+/// swapped for the viewing key of the same key in place, with no rescan, and
+/// the wallet is marked for saving.
+async fn drop_stored_spending_key(client: &LightClient) -> WalletResult<()> {
+    let mut wallet = client.wallet().write().await;
+    let stored_spending_key = match wallet.unified_key_store.get(&AccountId::ZERO) {
+        Some(stored @ UnifiedKeyStore::Spend(_)) => {
+            Some(UnifiedFullViewingKey::try_from(stored).map_err(|e| e.to_string())?)
+        }
+        _ => None,
+    };
+    if let Some(ufvk) = stored_spending_key {
+        wallet
+            .unified_key_store
+            .insert(AccountId::ZERO, UnifiedKeyStore::View(Box::new(ufvk)));
+        wallet.mark_dirty();
+    }
+    Ok(())
 }
 
 /// Whether the wallet holds a transaction it built or broadcast that is not
@@ -335,8 +412,8 @@ pub async fn initialize(
         shut_down(previous).await;
     }
 
-    // zingolib stores a phrase wallet's seed unencrypted, so the file is built
-    // from the Zcash spending key; older phrase files are rebuilt (rescan).
+    // zingolib writes the wallet's keys unencrypted, so the file is built from
+    // the Zcash viewing key; older phrase files are rebuilt (rescan).
     // A rebuild forgets sends that are not mined yet, so their notes would
     // look spendable until the rescan finds them: such a file is kept for
     // this launch and rebuilt on a later one, once nothing is in flight.
@@ -352,7 +429,7 @@ pub async fn initialize(
                 &wallet_dir,
                 chain,
                 uri.clone(),
-                usk_wallet_config(&chain, &mnemonic_seed, birthday_height)?,
+                ufvk_wallet_config(&chain, &mnemonic_seed, birthday_height)?,
                 true,
             )
             .await?
@@ -362,11 +439,13 @@ pub async fn initialize(
             &wallet_dir,
             chain,
             uri.clone(),
-            usk_wallet_config(&chain, &mnemonic_seed, birthday_height)?,
+            ufvk_wallet_config(&chain, &mnemonic_seed, birthday_height)?,
             new_wallet,
         )
         .await?
     };
+    // The save task writes the swapped key over the file within a second.
+    drop_stored_spending_key(&client).await?;
     client.save_task().await;
     client.sync().await.map_err(|e| e.to_string())?;
 
@@ -874,7 +953,17 @@ pub async fn create_transfer(
         return Err("mnemonic mismatch".to_string());
     }
 
-    match take_quote(&mut slot, &proposal_base64)? {
+    let quote = take_quote(&mut slot, &proposal_base64)?;
+    let ufvk = unlock_spending_key(&mut slot).await?;
+    let signed = sign_quote(&mut slot, quote).await;
+    lock_spending_key(&mut slot, ufvk).await;
+    signed
+}
+
+/// Signs a quote taken by `create_transfer`, with the spending key in the
+/// key store.
+async fn sign_quote(slot: &mut ClientSlot, quote: Quote) -> WalletResult<String> {
+    match quote {
         Quote::Ironwood { plan } => {
             // Hold sync still across the re-plan and the migration, so the
             // notes the migration spends are the ones checked here.
@@ -1091,16 +1180,22 @@ pub async fn shield_funds(
         return Err("transparent balance below shield threshold".to_string());
     }
 
-    slot.client
-        .propose_shield(AccountId::ZERO)
-        .await
-        .map_err(|e| describe_error(&e))?;
-    let txids = slot
-        .client
-        .send_stored_proposal(true)
-        .await
-        .map_err(|e| describe_error(&e))?;
-    Ok(txids.first().to_string())
+    let ufvk = unlock_spending_key(&mut slot).await?;
+    let sent: WalletResult<String> = async {
+        slot.client
+            .propose_shield(AccountId::ZERO)
+            .await
+            .map_err(|e| describe_error(&e))?;
+        let txids = slot
+            .client
+            .send_stored_proposal(true)
+            .await
+            .map_err(|e| describe_error(&e))?;
+        Ok(txids.first().to_string())
+    }
+    .await;
+    lock_spending_key(&mut slot, ufvk).await;
+    sent
 }
 
 pub async fn create_shield(alias: String, seed: String, threshold: String) -> WalletResult<String> {
@@ -1126,15 +1221,20 @@ pub async fn create_shield(alias: String, seed: String, threshold: String) -> Wa
         return Err("transparent balance below shield threshold".to_string());
     }
 
-    slot.client
-        .propose_shield(AccountId::ZERO)
-        .await
-        .map_err(|e| describe_error(&e))?;
-    let txids = slot
-        .client
-        .calculate_stored_proposal()
-        .await
-        .map_err(|e| describe_error(&e))?;
+    let ufvk = unlock_spending_key(&mut slot).await?;
+    let calculated: WalletResult<NonEmpty<TxId>> = async {
+        slot.client
+            .propose_shield(AccountId::ZERO)
+            .await
+            .map_err(|e| describe_error(&e))?;
+        slot.client
+            .calculate_stored_proposal()
+            .await
+            .map_err(|e| describe_error(&e))
+    }
+    .await;
+    lock_spending_key(&mut slot, ufvk).await;
+    let txids = calculated?;
     let txid = *txids.last();
     if slot.signed.len() >= MAX_QUOTES {
         slot.signed.pop_front();
@@ -1206,5 +1306,178 @@ mod broadcast_tests {
         assert!(!already_known("bad-txns-inputs-spent"));
         assert!(!already_known("tx expired"));
         assert!(!already_known("transport error"));
+    }
+}
+
+#[cfg(test)]
+mod key_at_rest_tests {
+    use super::*;
+    use secrecy::ExposeSecret;
+    use zcash_keys::keys::Era;
+
+    const PHRASE: &str = "abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon \
+        abandon abandon abandon abandon abandon art";
+    const OTHER_PHRASE: &str =
+        "zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo zoo wrong";
+    const BIRTHDAY: u32 = 3_000_000;
+    const CHAIN: ChainType = ChainType::Mainnet;
+
+    fn run<F: std::future::Future>(future: F) -> F::Output {
+        tokio::runtime::Runtime::new()
+            .expect("runtime")
+            .block_on(future)
+    }
+
+    /// Opens the wallet the way `open_client` does, but offline: with no
+    /// indexer set, the client does not dial one.
+    async fn open(dir: &std::path::Path, config: WalletConfig, overwrite: bool) -> LightClient {
+        ensure_default_crypto_provider();
+        let config = ClientConfig::builder()
+            .set_wallet_dir(dir.to_path_buf())
+            .set_wallet_name("zingo-wallet.dat".to_string())
+            .set_chain_type(CHAIN)
+            .set_wallet_config(config)
+            .build()
+            .expect("config");
+        LightClient::new(config, overwrite).await.expect("open wallet")
+    }
+
+    /// The config v0.1.1-tw.2 built its files from.
+    fn tw2_wallet_config(phrase: &str) -> WalletConfig {
+        let usk = spending_key(&CHAIN, phrase).expect("usk");
+        WalletConfig::Usk {
+            usk: usk.to_bytes(Era::Orchard).expose_secret().clone(),
+            birthday: BIRTHDAY,
+            wallet_settings: wallet_settings(),
+        }
+    }
+
+    /// Whether the wallet file contains account 0's Orchard spending key.
+    fn file_holds_spending_key(dir: &std::path::Path, phrase: &str) -> bool {
+        let usk = spending_key(&CHAIN, phrase).expect("usk");
+        let secret = usk.orchard().to_bytes();
+        let file = std::fs::read(dir.join("zingo-wallet.dat")).expect("wallet file");
+        file.windows(secret.len()).any(|window| window == secret)
+    }
+
+    async fn holds_spending_key(client: &LightClient) -> bool {
+        client
+            .wallet()
+            .read()
+            .await
+            .unified_key_store
+            .get(&AccountId::ZERO)
+            .expect("account 0 keys")
+            .is_spending_key()
+    }
+
+    async fn stored_ufvk(client: &LightClient) -> String {
+        let wallet = client.wallet().read().await;
+        let keys = wallet.unified_key_store.get(&AccountId::ZERO).expect("account 0 keys");
+        UnifiedFullViewingKey::try_from(keys)
+            .expect("ufvk")
+            .encode(&CHAIN)
+            .expect("encode")
+    }
+
+    fn slot(client: LightClient, phrase: &str) -> ClientSlot {
+        ClientSlot {
+            client,
+            mnemonic: phrase.to_string(),
+            quotes: VecDeque::new(),
+            signed: VecDeque::new(),
+        }
+    }
+
+    #[test]
+    fn a_new_wallet_file_holds_only_the_viewing_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run(async {
+            let config = ufvk_wallet_config(&CHAIN, PHRASE, BIRTHDAY).expect("config");
+            let mut client = open(dir.path(), config, true).await;
+            client.wallet().write().await.mark_dirty();
+            client.flush().await.expect("flush");
+            assert!(!holds_spending_key(&client).await);
+            assert_eq!(
+                stored_ufvk(&client).await,
+                derive_viewing_key(PHRASE.to_string(), "mainnet".to_string()).expect("ufvk")
+            );
+        });
+        assert!(!file_holds_spending_key(dir.path(), PHRASE));
+    }
+
+    #[test]
+    fn a_tw2_file_has_its_spending_key_swapped_for_the_viewing_key() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let before = run(async {
+            let mut client = open(dir.path(), tw2_wallet_config(PHRASE), true).await;
+            client.wallet().write().await.mark_dirty();
+            client.flush().await.expect("flush");
+            stored_ufvk(&client).await
+        });
+        // The check below would catch the key if it were still there.
+        assert!(file_holds_spending_key(dir.path(), PHRASE));
+
+        let after = run(async {
+            let mut client = open(dir.path(), WalletConfig::Read, false).await;
+            assert!(holds_spending_key(&client).await);
+            drop_stored_spending_key(&client).await.expect("swap");
+            assert!(!holds_spending_key(&client).await);
+            client.flush().await.expect("flush");
+            stored_ufvk(&client).await
+        });
+        assert_eq!(before, after);
+        assert!(!file_holds_spending_key(dir.path(), PHRASE));
+
+        run(async {
+            let client = open(dir.path(), WalletConfig::Read, false).await;
+            assert!(!holds_spending_key(&client).await);
+        });
+    }
+
+    #[test]
+    fn the_file_is_not_written_while_the_spending_key_is_in() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let wallet_path = dir.path().join("zingo-wallet.dat");
+        let second = std::time::Duration::from_millis(1500);
+        run(async {
+            let config = ufvk_wallet_config(&CHAIN, PHRASE, BIRTHDAY).expect("config");
+            let mut client = open(dir.path(), config, true).await;
+            client.save_task().await;
+            // Let the save task write the new wallet, then take the file away
+            // so any later write shows up.
+            tokio::time::sleep(second).await;
+            std::fs::remove_file(&wallet_path).expect("remove wallet file");
+            let mut slot = slot(client, PHRASE);
+
+            let ufvk = unlock_spending_key(&mut slot).await.expect("unlock");
+            assert!(holds_spending_key(&slot.client).await);
+            // A change while signing would be saved within a second if the
+            // save task were running.
+            slot.client.wallet().write().await.mark_dirty();
+            tokio::time::sleep(second).await;
+            assert!(!wallet_path.exists());
+
+            lock_spending_key(&mut slot, ufvk).await;
+            assert!(!holds_spending_key(&slot.client).await);
+            tokio::time::sleep(second).await;
+            assert!(wallet_path.exists());
+            slot.client.shutdown_save_task().await.expect("shutdown");
+        });
+        assert!(!file_holds_spending_key(dir.path(), PHRASE));
+    }
+
+    #[test]
+    fn another_phrase_does_not_unlock_the_wallet() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        run(async {
+            let config = ufvk_wallet_config(&CHAIN, PHRASE, BIRTHDAY).expect("config");
+            let client = open(dir.path(), config, true).await;
+            let mut slot = slot(client, OTHER_PHRASE);
+            let err = unlock_spending_key(&mut slot).await.expect_err("mismatch");
+            assert_eq!(err, "spending key does not match this wallet");
+            assert!(!holds_spending_key(&slot.client).await);
+        });
     }
 }
